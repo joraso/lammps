@@ -510,7 +510,7 @@ else()
 endif()
 
 if(BUILD_EXE)
-  add_executable(lmp ${LMP_SOURCES})
+  add_executable(lmp ${LMP_SOURCES} ../src/fix_brownian.cpp ../src/fix_brownian.h)
   if(BUILD_LIB)
     target_link_libraries(lmp lammps)
   else()
