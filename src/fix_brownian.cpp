@@ -85,14 +85,13 @@ int FixBrownian::setmask()
 {
     int mask = 0;
     mask |= INITIAL_INTEGRATE;
-    mask |= FINAL_INTEGRATE;
     return mask;
 }
 
 void FixBrownian::init()
 {
-    // is there more than one kind of
-    dt_eff = update->dt / drag;
+    // might need to change this later for units
+    dt_eff = update->dt;
 
     // We have to retrieve a few flags for the force calculations
     if (force->pair && force->pair->compute_flag) pair_compute_flag = 1;
@@ -115,20 +114,20 @@ void FixBrownian::initial_integrate(int /*vflag*/)
     double **f = atom->f;
     int *mask = atom->mask;
     int nlocal = atom->nlocal;
-    double (*eta)[3] = new double[nlocal][3];
+    double eta[3];
     double v_f[3];
     if (igroup == atom->firstgroup) nlocal = atom->nfirst;
 
     for (int i = 0; i < nlocal; i++) {
         if (mask[i] & groupbit) {
             // Draw random forces here
-            eta[i][0] = random_force();
-            eta[i][1] = random_force();
-            eta[i][2] = random_force();
+            eta[0] = random_force();
+            eta[1] = random_force();
+            eta[2] = random_force();
             // Set velocities
-            v[i][0] = f[i][0] + eta[i][0];
-            v[i][1] = f[i][1] + eta[i][0];
-            v[i][2] = f[i][2] + eta[i][0];
+            v[i][0] = f[i][0] + eta[0];
+            v[i][1] = f[i][1] + eta[0];
+            v[i][2] = f[i][2] + eta[0];
             // update to virtual position
             x[i][0] += dt_eff * v[i][0];
             x[i][1] += dt_eff * v[i][1];
@@ -144,10 +143,13 @@ void FixBrownian::initial_integrate(int /*vflag*/)
     for (int i = 0; i < nlocal; i++) {
         if (mask[i] & groupbit) {
             // retrieve random forces?
+            eta[0] = random_force();
+            eta[1] = random_force();
+            eta[2] = random_force();
             // calculate final velocities
-            v_f[0] = 0.5 * (v[i][0] + f[i][0] + eta[i][0]);
-            v_f[1] = 0.5 * (v[i][1] + f[i][1] + eta[i][1]);
-            v_f[2] = 0.5 * (v[i][2] + f[i][2] + eta[i][2]);
+            v_f[0] = 0.5 * (v[i][0] + f[i][0] + eta[0]);
+            v_f[1] = 0.5 * (v[i][1] + f[i][1] + eta[1]);
+            v_f[2] = 0.5 * (v[i][2] + f[i][2] + eta[2]);
             // Update to the real final position
             x[i][0] += dt_eff * (v_f[0] - v[i][0]);
             x[i][1] += dt_eff * (v_f[1] - v[i][1]);
@@ -158,9 +160,6 @@ void FixBrownian::initial_integrate(int /*vflag*/)
             v[i][2] = v_f[2];
         }
     }
-
-    // gotta clean up, don't want a memory leak...
-    delete[] eta;
 }
 
 /* ----------------------------------------------------------------------
@@ -169,7 +168,7 @@ void FixBrownian::initial_integrate(int /*vflag*/)
 
 inline double FixBrownian::random_force()
 {
-    return sqrt(2*Temp*dt_eff) * (random->uniform() - 0.5);
+    return sqrt(24*Temp/dt_eff) * (random->uniform() - 0.5);
 }
 
 void FixBrownian::force_clear()
