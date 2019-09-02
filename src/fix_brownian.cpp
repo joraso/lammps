@@ -93,6 +93,12 @@ void FixBrownian::init()
     // might need to change this later for units
     dt_eff = update->dt;
 
+    // Calculate the factor for the force for the gaussian rng
+    force_factor = sqrt(4*Temp/dt_eff);
+    // Calculate the factor for the force for the uniform rng - if you switch
+    // to uniform numbers, use this one instead!
+    //force_factor = sqrt(48*Temp/dt_eff);
+    
     // We have to retrieve a few flags for the force calculations
     if (force->pair && force->pair->compute_flag) pair_compute_flag = 1;
     else pair_compute_flag = 0;
@@ -154,7 +160,8 @@ void FixBrownian::initial_integrate(int /*vflag*/)
             x[i][0] += dt_eff * (v_f[0] - v[i][0]);
             x[i][1] += dt_eff * (v_f[1] - v[i][1]);
             x[i][2] += dt_eff * (v_f[2] - v[i][2]);
-            // properly store final velocities
+            // properly store final velocities (for the kinetice
+            // energy calculation - should not affect anything else.)
             v[i][0] = v_f[0];
             v[i][1] = v_f[1];
             v[i][2] = v_f[2];
@@ -168,7 +175,10 @@ void FixBrownian::initial_integrate(int /*vflag*/)
 
 inline double FixBrownian::random_force()
 {
-    return sqrt(24*Temp/dt_eff) * (random->uniform() - 0.5);
+    return force_factor * random->gaussian();
+    // Uncomment to switch to uniform rng. Also! Change the force factor
+    // declared in FixBrownian::init()
+    //return force_factor * (random->uniform() - 0.5);
 }
 
 void FixBrownian::force_clear()

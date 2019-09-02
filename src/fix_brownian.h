@@ -40,7 +40,7 @@ protected:
     // Fix variables
     double Temp, drag;
     int seed;
-    double dt_eff;
+    double dt_eff, force_factor;
     class RanMars *random;
     // Force calculation parameters
     int pair_compute_flag, kspace_compute_flag;
