@@ -18,7 +18,7 @@
    dynamics. (This is unlike the langevin fix, which does not handle
    the overdamped case.)
 
-   Currently, this fix works with the verlet run_styl, in place of
+   Currently, this fix works with the verlet run_style, in place of
    fix_nve or similar.
 ------------------------------------------------------------------------- */
 
@@ -94,10 +94,7 @@ void FixBrownian::init()
     dt_eff = update->dt;
 
     // Calculate the factor for the force for the gaussian rng
-    force_factor = sqrt(4*Temp/dt_eff);
-    // Calculate the factor for the force for the uniform rng - if you switch
-    // to uniform numbers, use this one instead!
-    //force_factor = sqrt(48*Temp/dt_eff);
+    force_factor = sqrt(2*Temp/dt_eff);
     
     // We have to retrieve a few flags for the force calculations
     if (force->pair && force->pair->compute_flag) pair_compute_flag = 1;
@@ -120,20 +117,24 @@ void FixBrownian::initial_integrate(int /*vflag*/)
     double **f = atom->f;
     int *mask = atom->mask;
     int nlocal = atom->nlocal;
-    double eta[3];
-    double v_f[3];
+    double (*eta)[3] = new double[nlocal][3];
+    double (*x0)[3] = new double[nlocal][3];
     if (igroup == atom->firstgroup) nlocal = atom->nfirst;
 
     for (int i = 0; i < nlocal; i++) {
         if (mask[i] & groupbit) {
+            // Store the initial positions
+            x0[i][0] = x[i][0];
+            x0[i][1] = x[i][1];
+            x0[i][2] = x[i][2];
             // Draw random forces here
-            eta[0] = random_force();
-            eta[1] = random_force();
-            eta[2] = random_force();
+            eta[i][0] = random_force();
+            eta[i][1] = random_force();
+            eta[i][2] = random_force();
             // Set velocities
-            v[i][0] = f[i][0] + eta[0];
-            v[i][1] = f[i][1] + eta[0];
-            v[i][2] = f[i][2] + eta[0];
+            v[i][0] = f[i][0] + eta[i][0];
+            v[i][1] = f[i][1] + eta[i][1];
+            v[i][2] = f[i][2] + eta[i][2];
             // update to virtual position
             x[i][0] += dt_eff * v[i][0];
             x[i][1] += dt_eff * v[i][1];
@@ -148,25 +149,20 @@ void FixBrownian::initial_integrate(int /*vflag*/)
     // take the real step
     for (int i = 0; i < nlocal; i++) {
         if (mask[i] & groupbit) {
-            // retrieve random forces?
-            eta[0] = random_force();
-            eta[1] = random_force();
-            eta[2] = random_force();
             // calculate final velocities
-            v_f[0] = 0.5 * (v[i][0] + f[i][0] + eta[0]);
-            v_f[1] = 0.5 * (v[i][1] + f[i][1] + eta[1]);
-            v_f[2] = 0.5 * (v[i][2] + f[i][2] + eta[2]);
+            v[i][0] = 0.5 * (v[i][0] + f[i][0] + eta[i][0]);
+            v[i][1] = 0.5 * (v[i][1] + f[i][1] + eta[i][1]);
+            v[i][2] = 0.5 * (v[i][2] + f[i][2] + eta[i][2]);
             // Update to the real final position
-            x[i][0] += dt_eff * (v_f[0] - v[i][0]);
-            x[i][1] += dt_eff * (v_f[1] - v[i][1]);
-            x[i][2] += dt_eff * (v_f[2] - v[i][2]);
-            // properly store final velocities (for the kinetice
-            // energy calculation - should not affect anything else.)
-            v[i][0] = v_f[0];
-            v[i][1] = v_f[1];
-            v[i][2] = v_f[2];
+            x[i][0] = x0[i][0] + dt_eff * v[i][0];
+            x[i][1] = x0[i][1] + dt_eff * v[i][1];
+            x[i][2] = x0[i][2] + dt_eff * v[i][2];
         }
     }
+    
+    // Must delete arrays:
+    delete[] eta;
+    delete[] x0;
 }
 
 /* ----------------------------------------------------------------------
@@ -176,9 +172,6 @@ void FixBrownian::initial_integrate(int /*vflag*/)
 inline double FixBrownian::random_force()
 {
     return force_factor * random->gaussian();
-    // Uncomment to switch to uniform rng. Also! Change the force factor
-    // declared in FixBrownian::init()
-    //return force_factor * (random->uniform() - 0.5);
 }
 
 void FixBrownian::force_clear()
