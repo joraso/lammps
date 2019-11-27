@@ -12,7 +12,7 @@
 ------------------------------------------------------------------------- */
 
 /* ----------------------------------------------------------------------
-   Contributing authors: Joseph Raso $ Joel Eaves (CU Boulder)
+   Contributing authors: Joseph Raso & Joel Eaves (CU Boulder)
 
    This fix will implement a Huen algorythm for overdamped brownian
    dynamics. (This is unlike the langevin fix, which does not handle
@@ -25,6 +25,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <memory>
+#include "memory.h"
 #include "fix_brownian.h"
 #include "atom.h"
 #include "atom_vec.h"
@@ -70,15 +72,23 @@ FixBrownian::FixBrownian(LAMMPS * lmp, int narg, char **arg):
     random = new RanMars(lmp,seed + comm->me);
 
     // Allocate save arrays
+    memory->create(this->x_previous,atom->nmax,3,"fix_brownian:x_previous");
+    memory->create(this->f_random,atom->nmax,3,"fix_brownian:f_random");
+    atom->add_callback(0);
+    //grow_arrays(atom->nmax);
 
 }
 
 FixBrownian::~FixBrownian()
 {
+    // Delete Arrays
+    memory->destroy(f_random);
+    memory->destroy(x_previous);
+    atom->delete_callback(id,0);
+    
     // Destroy RNG
+    if (random == nullptr) return;
     delete random;
-
-    // Destroy Save Arrays
 }
 
 int FixBrownian::setmask()
@@ -117,24 +127,23 @@ void FixBrownian::initial_integrate(int /*vflag*/)
     double **f = atom->f;
     int *mask = atom->mask;
     int nlocal = atom->nlocal;
-    double (*eta)[3] = new double[nlocal][3];
-    double (*x0)[3] = new double[nlocal][3];
+    
     if (igroup == atom->firstgroup) nlocal = atom->nfirst;
 
     for (int i = 0; i < nlocal; i++) {
         if (mask[i] & groupbit) {
             // Store the initial positions
-            x0[i][0] = x[i][0];
-            x0[i][1] = x[i][1];
-            x0[i][2] = x[i][2];
+            x_previous[i][0] = x[i][0];
+            x_previous[i][1] = x[i][1];
+            x_previous[i][2] = x[i][2];
             // Draw random forces here
-            eta[i][0] = random_force();
-            eta[i][1] = random_force();
-            eta[i][2] = random_force();
+            f_random[i][0] = random_force();
+            f_random[i][1] = random_force();
+            f_random[i][2] = random_force();
             // Set velocities
-            v[i][0] = f[i][0] + eta[i][0];
-            v[i][1] = f[i][1] + eta[i][1];
-            v[i][2] = f[i][2] + eta[i][2];
+            v[i][0] = f[i][0] + f_random[i][0];
+            v[i][1] = f[i][1] + f_random[i][1];
+            v[i][2] = f[i][2] + f_random[i][2];
             // update to virtual position
             x[i][0] += dt_eff * v[i][0];
             x[i][1] += dt_eff * v[i][1];
@@ -150,19 +159,15 @@ void FixBrownian::initial_integrate(int /*vflag*/)
     for (int i = 0; i < nlocal; i++) {
         if (mask[i] & groupbit) {
             // calculate final velocities
-            v[i][0] = 0.5 * (v[i][0] + f[i][0] + eta[i][0]);
-            v[i][1] = 0.5 * (v[i][1] + f[i][1] + eta[i][1]);
-            v[i][2] = 0.5 * (v[i][2] + f[i][2] + eta[i][2]);
+            v[i][0] = 0.5 * (v[i][0] + f[i][0] + f_random[i][0]);
+            v[i][1] = 0.5 * (v[i][1] + f[i][1] + f_random[i][1]);
+            v[i][2] = 0.5 * (v[i][2] + f[i][2] + f_random[i][2]);
             // Update to the real final position
-            x[i][0] = x0[i][0] + dt_eff * v[i][0];
-            x[i][1] = x0[i][1] + dt_eff * v[i][1];
-            x[i][2] = x0[i][2] + dt_eff * v[i][2];
+            x[i][0] = x_previous[i][0] + dt_eff * v[i][0];
+            x[i][1] = x_previous[i][1] + dt_eff * v[i][1];
+            x[i][2] = x_previous[i][2] + dt_eff * v[i][2];
         }
     }
-    
-    // Must delete arrays:
-    delete[] eta;
-    delete[] x0;
 }
 
 /* ----------------------------------------------------------------------
@@ -256,6 +261,59 @@ void FixBrownian::force_recalculate()
         comm->reverse_comm();
         timer->stamp(Timer::COMM);
     }
+}
+
+/* ----------------------------------------------------------------------
+memory manipulation functions
+------------------------------------------------------------------------- */
+
+void FixBrownian::grow_arrays(int nmax)
+{
+    memory->grow(this->x_previous,nmax,3,"fix_brownian:x_previous");
+    memory->grow(this->f_random,nmax,3,"fix_brownian:f_random");
+}
+
+void FixBrownian::copy_arrays(int i, int j, int /*delflag*/)
+{
+    memcpy(this->f_random[j],this->f_random[i],3*sizeof(double));
+    memcpy(this->x_previous[j],this->x_previous[i],3*sizeof(double));
+}
+
+int FixBrownian::pack_exchange(int i, double *buf)
+{
+    int m = 0;
+    buf[m++] = x_previous[i][0];
+    buf[m++] = x_previous[i][1];
+    buf[m++] = x_previous[i][2];
+    buf[m++] = f_random[i][0];
+    buf[m++] = f_random[i][1];
+    buf[m++] = f_random[i][2];
+    return m;
+}
+
+int FixBrownian::unpack_exchange(int nlocal, double *buf)
+{
+    int m = 0;
+    x_previous[nlocal][0] = buf[m++];
+    x_previous[nlocal][1] = buf[m++];
+    x_previous[nlocal][2] = buf[m++];
+    f_random[nlocal][0] = buf[m++];
+    f_random[nlocal][1] = buf[m++];
+    f_random[nlocal][2] = buf[m++];
+    return m;
+}
+
+double FixBrownian::memory_usage() {
+    int nmax = atom->nmax;
+    double bytes = 0;
+    //We're sending 2 arrays of size nmax x 3.
+    bytes = 2*3*nmax*sizeof(double);
+    return bytes;
+}
+
+void FixBrownian::set_arrays(int i) {
+    memset(this->x_previous[i],0,sizeof(double)*3);
+    memset(this->f_random[i],0,sizeof(double)*3);
 }
 
 /* ---------------------------------------------------------------------- */

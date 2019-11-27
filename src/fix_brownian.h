@@ -32,11 +32,21 @@ public:
     int setmask();
     virtual void init();
     virtual void initial_integrate(int);
+    // Memory functions
+    void grow_arrays(int);
+    void copy_arrays(int,int,int);
+    int pack_exchange(int, double*);
+    int unpack_exchange(int, double*);
+    double memory_usage();
+    void set_arrays(int);
 protected:
     // Non-Canonical functions
     inline double random_force();
     virtual void force_clear();
     virtual void force_recalculate();
+    // Save Arrars
+    double** f_random;
+    double** x_previous;
     // Fix variables
     double Temp, drag;
     int seed;
