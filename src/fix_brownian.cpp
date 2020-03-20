@@ -18,9 +18,11 @@
    dynamics. (This is unlike the langevin fix, which does not handle
    the overdamped case.)
 
-   Currently, this fix works with the verlet run_style, in place of
-   fix_nve or similar.
+   Currently, this fix works in conjuction with fix nve (which must be invoked
+   after it.)
 ------------------------------------------------------------------------- */
+
+#include <iostream> // yeah yeah, remove later etc.
 
 #include <cstdio>
 #include <cstring>
@@ -30,18 +32,22 @@
 #include "fix_brownian.h"
 #include "atom.h"
 #include "atom_vec.h"
+/*
 #include "neighbor.h"
 #include "force.h"
 #include "angle.h"
 #include "dihedral.h"
 #include "improper.h"
 #include "kspace.h"
+*/
 #include "update.h"
 #include "error.h"
 #include "random_mars.h"
 #include "force.h"
+/*
 #include "pair.h"
 #include "bond.h"
+*/
 #include "comm.h"
 #include "timer.h"
 
@@ -70,24 +76,32 @@ FixBrownian::FixBrownian(LAMMPS * lmp, int narg, char **arg):
 
     // Create and seed the random number generator
     random = new RanMars(lmp,seed + comm->me);
-
+    
     // Allocate save arrays
-    memory->create(this->x_previous,atom->nmax,3,"fix_brownian:x_previous");
-    memory->create(this->f_random,atom->nmax,3,"fix_brownian:f_random");
-    atom->add_callback(0);
-    //grow_arrays(atom->nmax);
+    fp_ind = new int[3];
 
+    for (int k=0; k<3; k++){
+        fp_ind[k] = atom->add_custom("fprev",1);
+    }
+    
+    nmax_old = 0; //setting initial array sizes to 0.
+    if (!lmp->kokkos) grow_arrays(atom->nmax); //init arrays
+    atom->add_callback(0);
+    
+    
 }
 
 FixBrownian::~FixBrownian()
 {
     // Delete Arrays
-    memory->destroy(f_random);
-    memory->destroy(x_previous);
+    for (int k=0; k<3; k++){
+        atom->remove_custom(1,fp_ind[k]);
+    }
     atom->delete_callback(id,0);
+    delete [] fp_ind;
     
     // Destroy RNG
-    if (random == nullptr) return;
+    //if (random == nullptr) return; // Doesn't work on enemy, requires C++11
     delete random;
 }
 
@@ -100,74 +114,50 @@ int FixBrownian::setmask()
 
 void FixBrownian::init()
 {
-    // might need to change this later for units
-    dt_eff = update->dt;
 
-    // Calculate the factor for the force for the gaussian rng
-    force_factor = sqrt(2*Temp/dt_eff);
+    // Calculate prefactor on the random force
+    rand_prefactor = sqrt((2*Temp)/(update->dt * drag));
     
-    // We have to retrieve a few flags for the force calculations
-    if (force->pair && force->pair->compute_flag) pair_compute_flag = 1;
-    else pair_compute_flag = 0;
-    if (force->kspace && force->kspace->compute_flag) kspace_compute_flag = 1;
-    else kspace_compute_flag = 0;
-
-    // And for force-clearing
-    // (currently does not support external force clearing via omp)
-    torqueflag = extraflag = 0;
-    if (atom->torque_flag) torqueflag = 1;
-    if (atom->avec->forceclearflag) extraflag = 1;
+    // Calculate adjustment to LJ forces
+    force_adjust = 1 / (update->dt * drag * force->ftm2v);
+    
+    // Another prefactor used in the correction step
+    v_prefactor = 0.5 / drag;
+    
+    // Store initial values into f_previous.
+    //Should not be neccessary, but just in case.
+    double **f = atom->f;
+    int *mask = atom->mask;
+    int nlocal = atom->nlocal;
+    if (igroup == atom->firstgroup) nlocal = atom->nfirst;
+    for (int i = 0; i < nlocal; i++) {
+        if (mask[i] & groupbit) {
+            for (int k=0; k<3; k++){
+                atom->dvector[fp_ind[k]][i] = f[i][k];
+            }
+        }
+    }
+    
+    // Finally (redundantly), ensure the intigrator begins with a
+    // predictor step.
+    halfstepflag = 0;
 }
 
 void FixBrownian::initial_integrate(int /*vflag*/)
 {
 
-    double **x = atom->x;
-    double **v = atom->v;
-    double **f = atom->f;
-    int *mask = atom->mask;
-    int nlocal = atom->nlocal;
+    switch (halfstepflag) {
+        case 0:
+            predictor();
+            halfstepflag = 1;
+            break;
+        case 1:
+            corrector();
+            halfstepflag = 0;
+            break;
+    }
     
-    if (igroup == atom->firstgroup) nlocal = atom->nfirst;
-
-    for (int i = 0; i < nlocal; i++) {
-        if (mask[i] & groupbit) {
-            // Store the initial positions
-            x_previous[i][0] = x[i][0];
-            x_previous[i][1] = x[i][1];
-            x_previous[i][2] = x[i][2];
-            // Draw random forces here
-            f_random[i][0] = random_force();
-            f_random[i][1] = random_force();
-            f_random[i][2] = random_force();
-            // Set velocities
-            v[i][0] = f[i][0] + f_random[i][0];
-            v[i][1] = f[i][1] + f_random[i][1];
-            v[i][2] = f[i][2] + f_random[i][2];
-            // update to virtual position
-            x[i][0] += dt_eff * v[i][0];
-            x[i][1] += dt_eff * v[i][1];
-            x[i][2] += dt_eff * v[i][2];
-        }
-    }
-
-    // recalculate the forces.
-    force_recalculate();
-
-    // update the velocities
-    // take the real step
-    for (int i = 0; i < nlocal; i++) {
-        if (mask[i] & groupbit) {
-            // calculate final velocities
-            v[i][0] = 0.5 * (v[i][0] + f[i][0] + f_random[i][0]);
-            v[i][1] = 0.5 * (v[i][1] + f[i][1] + f_random[i][1]);
-            v[i][2] = 0.5 * (v[i][2] + f[i][2] + f_random[i][2]);
-            // Update to the real final position
-            x[i][0] = x_previous[i][0] + dt_eff * v[i][0];
-            x[i][1] = x_previous[i][1] + dt_eff * v[i][1];
-            x[i][2] = x_previous[i][2] + dt_eff * v[i][2];
-        }
-    }
+    
 }
 
 /* ----------------------------------------------------------------------
@@ -176,90 +166,81 @@ void FixBrownian::initial_integrate(int /*vflag*/)
 
 inline double FixBrownian::random_force()
 {
-    return force_factor * random->gaussian();
+    return rand_prefactor * random->gaussian();
 }
 
-void FixBrownian::force_clear()
-{
-    // Clears the forces - this version is from copied Verlet->force_clear
-    // there is a similar version in min->force_clear
-
-    // if either newton flag is set, also include ghosts
-    // when using threads always clear all forces.
+void FixBrownian::predictor(){
+    double **v = atom->v;
+    double **f = atom->f;
+    double *rmass = atom->rmass;
+    double *mass = atom->mass;
+    int *type = atom->type;
+    int *mask = atom->mask;
     int nlocal = atom->nlocal;
-    size_t nbytes;
+    double f_mass_adj;
 
-    if (neighbor->includegroup == 0) {
-        nbytes = sizeof(double) * nlocal;
-        if (force->newton) nbytes += sizeof(double) * atom->nghost;
-
-        if (nbytes) {
-            memset(&atom->f[0][0],0,3*nbytes);
-            if (torqueflag) memset(&atom->torque[0][0],0,3*nbytes);
-            if (extraflag) atom->avec->force_clear(0,nbytes);
+    if (igroup == atom->firstgroup) nlocal = atom->nfirst;
+    
+    if (rmass) {
+        for (int i = 0; i < nlocal; i++) {
+            if (mask[i] & groupbit) {
+                f_mass_adj = force_adjust * rmass[i];
+                for (int k=0; k<3; k++){
+                    atom->dvector[fp_ind[k]][i] = f[i][k];
+                    v[i][k] = random_force();
+                    f[i][k] *= 2 * f_mass_adj;
+                    
+                }
+            }
         }
     } else {
-        // neighbor includegroup flag is set
-        // clear force only on initial nfirst particles
-        // if either newton flag is set, also include ghosts
-        nbytes = sizeof(double) * atom->nfirst;
-        if (nbytes) {
-            memset(&atom->f[0][0],0,3*nbytes);
-            if (torqueflag) memset(&atom->torque[0][0],0,3*nbytes);
-            if (extraflag) atom->avec->force_clear(0,nbytes);
-        }
-        if (force->newton) {
-            nbytes = sizeof(double) * atom->nghost;
-            if (nbytes) {
-                memset(&atom->f[nlocal][0],0,3*nbytes);
-                if (torqueflag) memset(&atom->torque[nlocal][0],0,3*nbytes);
-                if (extraflag) atom->avec->force_clear(nlocal,nbytes);
+        for (int i = 0; i < nlocal; i++) {
+            if (mask[i] & groupbit) {
+                f_mass_adj = force_adjust * mass[type[i]];
+                for (int k=0; k<3; k++){
+                    atom->dvector[fp_ind[k]][i] = f[i][k];
+                    v[i][k] = random_force();
+                    f[i][k] *= 2 * f_mass_adj;
+                    
+                }
             }
         }
     }
-
-
+    
 }
 
-void FixBrownian::force_recalculate()
-{
-    // recalculates the forces
-    // mostly copied from the verlet integrator itself in Verlet->run()
-    // but also compare to min->energy_force()
-
-    // notably, this WILL NOT re-partition the atoms to different processors
-
-    // Note: for the time being, both these flags are set to zero, meaning
-    // neither the energy nor the pressure (virial) will be computed as
-    // part of this recalculation.
-    int eflag = 0;
-    int vflag = 0;
-
-    force_clear();
-
-    timer->stamp();
-
-    if (pair_compute_flag) {
-        force->pair->compute(eflag,vflag);
-        timer->stamp(Timer::PAIR);
-    }
-
-    if (atom->molecular) {
-        if (force->bond) force->bond->compute(eflag,vflag);
-        if (force->angle) force->angle->compute(eflag,vflag);
-        if (force->dihedral) force->dihedral->compute(eflag,vflag);
-        if (force->improper) force->improper->compute(eflag,vflag);
-        timer->stamp(Timer::BOND);
-    }
-
-    if (kspace_compute_flag) {
-        force->kspace->compute(eflag,vflag);
-        timer->stamp(Timer::KSPACE);
-    }
-
-    if (force->newton) {
-        comm->reverse_comm();
-        timer->stamp(Timer::COMM);
+void FixBrownian::corrector(){
+    double **v = atom->v;
+    double **f = atom->f;
+    double *rmass = atom->rmass;
+    double *mass = atom->mass;
+    int *type = atom->type;
+    int *mask = atom->mask;
+    int nlocal = atom->nlocal;
+    double f_mass_adj;
+    
+    if (igroup == atom->firstgroup) nlocal = atom->nfirst;
+    
+    if (rmass) {
+        for (int i = 0; i < nlocal; i++) {
+            if (mask[i] & groupbit) {
+                f_mass_adj = force_adjust * rmass[i];
+                for (int k=0; k<3; k++){
+                    v[i][k] = -(v_prefactor * atom->dvector[fp_ind[k]][i]);
+                    f[i][k] *= force_adjust;
+                }
+            }
+        }
+    } else {
+        for (int i = 0; i < nlocal; i++) {
+            if (mask[i] & groupbit) {
+            f_mass_adj = force_adjust * mass[type[i]];
+                for (int k=0; k<3; k++){
+                    v[i][k] = -(v_prefactor * atom->dvector[fp_ind[k]][i]);
+                    f[i][k] *= force_adjust;
+                }
+            }
+        }
     }
 }
 
@@ -269,51 +250,46 @@ memory manipulation functions
 
 void FixBrownian::grow_arrays(int nmax)
 {
-    memory->grow(this->x_previous,nmax,3,"fix_brownian:x_previous");
-    memory->grow(this->f_random,nmax,3,"fix_brownian:f_random");
+    //memory->grow(this->x_previous,nmax,3,"fix_brownian:x_previous");
+    //memory->grow(this->f_random,nmax,3,"fix_brownian:f_random");
+    size_t nbytes = (nmax-nmax_old) * sizeof(double);
+    for (int k=0; k<3; k++){
+        memory->grow(atom->dvector[fp_ind[k]],nmax,"atom:dvector");
+        memset(&atom->dvector[fp_ind[k]][nmax_old],0,nbytes);
+    }
+    nmax_old = nmax;
 }
 
 void FixBrownian::copy_arrays(int i, int j, int /*delflag*/)
 {
-    memcpy(this->f_random[j],this->f_random[i],3*sizeof(double));
-    memcpy(this->x_previous[j],this->x_previous[i],3*sizeof(double));
+    for (int k=0; k<3; k++){
+        atom->dvector[fp_ind[k]][j] = atom->dvector[fp_ind[k]][i];
+    }
 }
 
 int FixBrownian::pack_exchange(int i, double *buf)
 {
     int m = 0;
-    buf[m++] = x_previous[i][0];
-    buf[m++] = x_previous[i][1];
-    buf[m++] = x_previous[i][2];
-    buf[m++] = f_random[i][0];
-    buf[m++] = f_random[i][1];
-    buf[m++] = f_random[i][2];
+    for (int k=0; k<3; k++){
+        buf[m++] = atom->dvector[fp_ind[k]][i];
+    }
     return m;
 }
 
 int FixBrownian::unpack_exchange(int nlocal, double *buf)
 {
     int m = 0;
-    x_previous[nlocal][0] = buf[m++];
-    x_previous[nlocal][1] = buf[m++];
-    x_previous[nlocal][2] = buf[m++];
-    f_random[nlocal][0] = buf[m++];
-    f_random[nlocal][1] = buf[m++];
-    f_random[nlocal][2] = buf[m++];
+    for (int k=0; k<3; k++){
+        atom->dvector[fp_ind[k]][nlocal] = buf[m++];
+    }
     return m;
 }
 
 double FixBrownian::memory_usage() {
     int nmax = atom->nmax;
-    double bytes = 0;
-    //We're sending 2 arrays of size nmax x 3.
-    bytes = 2*3*nmax*sizeof(double);
+    double bytes = 0.0;
+    bytes = 3*nmax*sizeof(double);
     return bytes;
-}
-
-void FixBrownian::set_arrays(int i) {
-    memset(this->x_previous[i],0,sizeof(double)*3);
-    memset(this->f_random[i],0,sizeof(double)*3);
 }
 
 /* ---------------------------------------------------------------------- */

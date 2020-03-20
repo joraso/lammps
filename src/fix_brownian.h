@@ -38,23 +38,21 @@ public:
     int pack_exchange(int, double*);
     int unpack_exchange(int, double*);
     double memory_usage();
-    void set_arrays(int);
+    //void set_arrays(int);
 protected:
     // Non-Canonical functions
     inline double random_force();
-    virtual void force_clear();
-    virtual void force_recalculate();
-    // Save Arrars
-    double** f_random;
-    double** x_previous;
+    void predictor();
+    void corrector();
+    int halfstepflag; // track whether to perform predictor or corrector.
+    // Save Arrays
+    int *fp_ind; // the f_previous atom property index
+    int nmax_old; // length of peratom arrays the last time they grew
     // Fix variables
     double Temp, drag;
     int seed;
-    double dt_eff, force_factor;
+    double rand_prefactor, force_adjust, v_prefactor;
     class RanMars *random;
-    // Force calculation parameters
-    int pair_compute_flag, kspace_compute_flag;
-    int torqueflag, extraflag;
 };
 
 }
